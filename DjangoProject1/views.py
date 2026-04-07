@@ -66,7 +66,6 @@ def draw_matches_on_images(img1, img2, kp1, kp2, matches, max_display=50):
 
     matches_sorted = sorted(matches, key=lambda m: m[2])[:max_display]
     
-    # Generate highly distinct colors for points
     random.seed(42) 
     palette = []
     for _ in range(max_display):
@@ -169,14 +168,17 @@ def match_descriptors(descs1, descs2, method="ssd", ratio_threshold=0.8):
     metric = 'sqeuclidean' if method == "ssd" else 'correlation'
     dists = cdist(d1, d2, metric=metric)
 
+    # FIX: Lowe's ratio test is based on linear Euclidean distance.
+    # Since our metrics are squared (SSD and 1-NCC), we MUST square the threshold.
+    effective_ratio = ratio_threshold ** 2
+
     matches = []
     for i, row in enumerate(dists):
         idx = np.argsort(row)
         best_j, second_best_j = idx[0], idx[1]
         best_dist, second_dist = row[best_j], row[second_best_j]
 
-        if second_dist > 1e-9 and (best_dist / second_dist) < ratio_threshold:
-            # Mutual nearest neighbor check
+        if second_dist > 1e-9 and (best_dist / second_dist) < effective_ratio:
             if np.argmin(dists[:, best_j]) == i:
                 matches.append((i, int(best_j), round(float(best_dist), 6)))
                 
@@ -197,20 +199,19 @@ class HarrisCornerDetector:
         gray = np.array(img.convert('L'), dtype=np.float32)
         gray = gaussian_filter(gray, sigma=sigma)
         
-        # Exact Sobel to match original
         Ix = sobel(gray, axis=1)
         Iy = sobel(gray, axis=0)
         
-        # Structure Tensor using exact Box Filter (uniform sum), not Gaussian
         box_area = window_size ** 2
         Ixx = uniform_filter(Ix * Ix, size=window_size) * box_area
         Iyy = uniform_filter(Iy * Iy, size=window_size) * box_area
         Ixy = uniform_filter(Ix * Iy, size=window_size) * box_area
 
         if method == "lambda_minus":
-            # Exact original formula restored
             a, c, b = Ixx, Iyy, Ixy
-            R = (a + c) / 2.0 - np.sqrt(b**2 + (a - c)**2) / 2.0
+            # FIX: The mathematical discriminant for Eigenvalues is (a-c)^2 + 4b^2. 
+            # The '4 *' multiplier was completely missing in the previous version!
+            R = (a + c) / 2.0 - np.sqrt((a - c)**2 + 4 * b**2) / 2.0
         else:
             det = Ixx * Iyy - Ixy**2
             trace = Ixx + Iyy
@@ -255,7 +256,6 @@ class SIFTFeatureExtractor:
         width, height = img.size
         gray = np.array(img.convert('L'), dtype=np.float32)
 
-        # 1. Scale Space
         octaves = []
         current_gray = gray
         s_factor = 2.0 ** (1.0 / self.num_scales)
@@ -273,7 +273,6 @@ class SIFTFeatureExtractor:
             octaves.append((oct_scales, current_gray.shape[1], current_gray.shape[0]))
             current_gray = current_gray[::2, ::2]
 
-        # 2. DoG
         dog_pyramid = []
         for oct_scales, ow, oh in octaves:
             dog_layers = []
@@ -281,7 +280,6 @@ class SIFTFeatureExtractor:
                 dog_layers.append(oct_scales[i+1][0] - oct_scales[i][0])
             dog_pyramid.append((np.array(dog_layers), ow, oh))
 
-        # 3. Find Extrema
         candidates = []
         for oct_idx, (dog_layers, ow, oh) in enumerate(dog_pyramid):
             if len(dog_layers) < 3: continue
@@ -297,7 +295,6 @@ class SIFTFeatureExtractor:
         candidates.sort(key=lambda t: t[0], reverse=True)
         candidates = candidates[:max_keypoints]
 
-        # 4. Exact original central differences (No division by 2)
         grad_cache = {}
         for _, oct_idx, s, _, _ in candidates:
             if (oct_idx, s) not in grad_cache:
@@ -311,7 +308,6 @@ class SIFTFeatureExtractor:
                 ori = np.degrees(np.arctan2(Iy, Ix)) % 360.0
                 grad_cache[(oct_idx, s)] = (mag, ori)
 
-        # 5. Extract descriptors using the original mathematically robust logic
         keypoints = []
         descriptors = []
         for _, oct_idx, s, x, y in candidates:
@@ -456,7 +452,6 @@ class FeatureMatcher:
         gray1 = np.array(feat1["image"].convert('L'), dtype=np.float32)
         gray2 = np.array(feat2["image"].convert('L'), dtype=np.float32)
 
-        # Apply robust filtering rules restored from original code
         if len(matches) < 40:
             matches = self._filter_matches_ransac_affine(kp1, kp2, matches, thresh_px=14.0, iters=250, min_inliers=6)
         else:
