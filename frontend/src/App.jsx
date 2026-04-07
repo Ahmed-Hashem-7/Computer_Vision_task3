@@ -407,12 +407,12 @@ export default function App() {
   const [siftOctaves, setSiftOctaves] = useState(3);
   const [siftScales, setSiftScales] = useState(4);
   const [siftContrast, setSiftContrast] = useState(0.03);
-  const [siftMaxKp, setSiftMaxKp] = useState(200);
+  const [siftMaxKp, setSiftMaxKp] = useState(100);
 
   // ── Match params ──────────────────────────────────────────────────
   const [matchMethod, setMatchMethod] = useState("ssd");
   const [ratioThreshold, setRatioThreshold] = useState(0.8);
-  const [matchMaxKp, setMatchMaxKp] = useState(150);
+  const [matchMaxKp, setMatchMaxKp] = useState(75);
 
   // ── Inputs ────────────────────────────────────────────────────────
   const [imageA, setImageA] = useState(null); // base64 data-uri
@@ -534,6 +534,9 @@ export default function App() {
         computation_time_ms: data.computation_time_ms,
         width: data.image_size?.width,
         height: data.image_size?.height,
+        kp_density: data.image_size
+          ? ((data.num_keypoints / (data.image_size.width * data.image_size.height)) * 1000).toFixed(2)
+          : null,
       });
     } catch (err) {
       setError(err.message);
@@ -570,6 +573,8 @@ export default function App() {
         computation_time_ms: data.computation_time_ms,
         sift_time_ms: data.sift_time_ms,
         match_time_ms: data.match_time_ms,
+        kp1: data.keypoints1?.length ?? 0,
+        kp2: data.keypoints2?.length ?? 0,
       });
     } catch (err) {
       setError(err.message);
@@ -817,8 +822,11 @@ export default function App() {
                     <span className="param-name">Max keypoints</span>
                     <span className="param-value">{siftMaxKp}</span>
                   </div>
-                  <input type="range" min="50" max="400" step="25"
+                  <input type="range" min="50" max="300" step="25"
                     value={siftMaxKp} onChange={(e) => setSiftMaxKp(parseInt(e.target.value))} />
+                  <div className="method-desc" style={{marginTop:6}}>
+                    ↑ more detail · ↓ faster (~{siftMaxKp <= 100 ? "5-15s" : siftMaxKp <= 200 ? "15-40s" : "40-90s"})
+                  </div>
                 </div>
               )}
 
@@ -829,8 +837,11 @@ export default function App() {
                       <span className="param-name">Max keypoints / image</span>
                       <span className="param-value">{matchMaxKp}</span>
                     </div>
-                    <input type="range" min="50" max="300" step="25"
+                    <input type="range" min="50" max="200" step="25"
                       value={matchMaxKp} onChange={(e) => setMatchMaxKp(parseInt(e.target.value))} />
+                    <div className="method-desc" style={{marginTop:6}}>
+                      ↑ more matches · ↓ faster (~{matchMaxKp <= 75 ? "10-30s" : matchMaxKp <= 125 ? "30-60s" : "60-120s"})
+                    </div>
                   </div>
                   <div className="param-row">
                     <div className="param-header">
@@ -888,14 +899,14 @@ export default function App() {
 
             {mode === "sift" && siftStats && (
               <div className="section">
-                <div className="section-title">Results</div>
+                <div className="section-title">Results — SIFT Report</div>
                 <div className="stats-grid">
                   <div className="stat-card">
-                    <div className="stat-label">Keypoints</div>
+                    <div className="stat-label">Keypoints found</div>
                     <div className="stat-value">{siftStats.num_keypoints}</div>
                   </div>
                   <div className="stat-card">
-                    <div className="stat-label">Compute time</div>
+                    <div className="stat-label">Computation time</div>
                     <div className="stat-value time">
                       {siftStats.computation_time_ms < 1000
                         ? siftStats.computation_time_ms.toFixed(0)
@@ -906,12 +917,12 @@ export default function App() {
                     </div>
                   </div>
                   <div className="stat-card">
-                    <div className="stat-label">Image width</div>
-                    <div className="stat-value" style={{ fontSize: 16 }}>{siftStats.width}<span className="stat-unit">px</span></div>
+                    <div className="stat-label">Image size</div>
+                    <div className="stat-value" style={{ fontSize: 14 }}>{siftStats.width}×{siftStats.height}<span className="stat-unit">px</span></div>
                   </div>
                   <div className="stat-card">
-                    <div className="stat-label">Image height</div>
-                    <div className="stat-value" style={{ fontSize: 16 }}>{siftStats.height}<span className="stat-unit">px</span></div>
+                    <div className="stat-label">Density (kp/kpx)</div>
+                    <div className="stat-value" style={{ fontSize: 16 }}>{siftStats.kp_density}<span className="stat-unit"></span></div>
                   </div>
                 </div>
               </div>
@@ -919,10 +930,10 @@ export default function App() {
 
             {mode === "match" && matchStats && (
               <div className="section">
-                <div className="section-title">Results</div>
+                <div className="section-title">Results — Match Report</div>
                 <div className="stats-grid">
                   <div className="stat-card">
-                    <div className="stat-label">Matches</div>
+                    <div className="stat-label">Matches found</div>
                     <div className="stat-value">{matchStats.num_matches}</div>
                   </div>
                   <div className="stat-card">
@@ -938,11 +949,31 @@ export default function App() {
                   </div>
                   <div className="stat-card">
                     <div className="stat-label">SIFT time</div>
-                    <div className="stat-value" style={{ fontSize: 16 }}>{matchStats.sift_time_ms}<span className="stat-unit">ms</span></div>
+                    <div className="stat-value" style={{ fontSize: 15 }}>
+                      {(matchStats.sift_time_ms / 1000).toFixed(2)}<span className="stat-unit">s</span>
+                    </div>
                   </div>
                   <div className="stat-card">
                     <div className="stat-label">Match time</div>
-                    <div className="stat-value" style={{ fontSize: 16 }}>{matchStats.match_time_ms}<span className="stat-unit">ms</span></div>
+                    <div className="stat-value" style={{ fontSize: 15 }}>
+                      {matchStats.match_time_ms < 1000
+                        ? matchStats.match_time_ms.toFixed(0)
+                        : (matchStats.match_time_ms / 1000).toFixed(2)}
+                      <span className="stat-unit">{matchStats.match_time_ms < 1000 ? "ms" : "s"}</span>
+                    </div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="stat-label">KP img A / B</div>
+                    <div className="stat-value" style={{ fontSize: 14 }}>{matchStats.kp1} / {matchStats.kp2}</div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="stat-label">Match quality</div>
+                    <div className="stat-value" style={{ fontSize: 14 }}>
+                      {matchStats.kp1 + matchStats.kp2 > 0
+                        ? ((matchStats.num_matches / Math.min(matchStats.kp1, matchStats.kp2)) * 100).toFixed(0)
+                        : "—"}
+                      <span className="stat-unit">%</span>
+                    </div>
                   </div>
                 </div>
               </div>

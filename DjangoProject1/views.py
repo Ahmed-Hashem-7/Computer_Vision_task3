@@ -24,67 +24,68 @@ def image_to_grayscale(pixels, width, height):
     return gray
 
 
-def apply_gaussian_blur(gray, width, height, sigma=1.0):
-    """Apply a Gaussian blur using a 5x5 kernel."""
-    radius = 2
-    size = 2 * radius + 1
-    kernel = [[0.0] * size for _ in range(size)]
-    kernel_sum = 0.0
-    for ky in range(size):
-        for kx in range(size):
-            dy = ky - radius
-            dx = kx - radius
-            val = math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma))
-            kernel[ky][kx] = val
-            kernel_sum += val
-    for ky in range(size):
-        for kx in range(size):
-            kernel[ky][kx] /= kernel_sum
-
-    blurred = [[0.0] * width for _ in range(height)]
-    for y in range(height):
-        for x in range(width):
-            acc = 0.0
-            for ky in range(size):
-                for kx in range(size):
-                    ny = min(max(y + ky - radius, 0), height - 1)
-                    nx = min(max(x + kx - radius, 0), width - 1)
-                    acc += gray[ny][nx] * kernel[ky][kx]
-            blurred[y][x] = acc
-    return blurred
+def _gaussian_kernel_1d(sigma, truncate=2.5):
+    """Build a normalised 1-D Gaussian kernel.  truncate controls half-width."""
+    radius = max(1, int(math.ceil(truncate * sigma)))
+    s2 = 2.0 * sigma * sigma
+    kernel = []
+    total = 0.0
+    for i in range(2 * radius + 1):
+        d = i - radius
+        v = math.exp(-(d * d) / s2)
+        kernel.append(v)
+        total += v
+    inv = 1.0 / total
+    return [v * inv for v in kernel], radius
 
 
 def apply_gaussian_blur_sigma(gray, width, height, sigma):
     """
-    Generic Gaussian blur with kernel size derived from sigma.
-    radius = ceil(3*sigma), ensures kernel covers ±3σ.
-    """
-    radius = max(1, int(math.ceil(3 * sigma)))
-    size = 2 * radius + 1
-    kernel = [[0.0] * size for _ in range(size)]
-    kernel_sum = 0.0
-    for ky in range(size):
-        for kx in range(size):
-            dy = ky - radius
-            dx = kx - radius
-            val = math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma))
-            kernel[ky][kx] = val
-            kernel_sum += val
-    for ky in range(size):
-        for kx in range(size):
-            kernel[ky][kx] /= kernel_sum
+    Separable Gaussian blur — two 1-D convolution passes.
 
-    blurred = [[0.0] * width for _ in range(height)]
+    Speedup over naive 2-D convolution: ≈ kernel_size / 2.
+    For sigma=1.6 this is ~4.5×; for larger sigmas even more.
+    Mathematically identical to a separable 2-D Gaussian.
+    """
+    kernel, radius = _gaussian_kernel_1d(sigma)
+    size = len(kernel)
+
+    # ── Horizontal pass (row by row) ─────────────────────────────────
+    tmp = [[0.0] * width for _ in range(height)]
     for y in range(height):
+        row = gray[y]
+        tmp_row = tmp[y]
         for x in range(width):
             acc = 0.0
-            for ky in range(size):
-                for kx in range(size):
-                    ny = min(max(y + ky - radius, 0), height - 1)
-                    nx = min(max(x + kx - radius, 0), width - 1)
-                    acc += gray[ny][nx] * kernel[ky][kx]
-            blurred[y][x] = acc
-    return blurred
+            for k in range(size):
+                nx = x + k - radius
+                if nx < 0:
+                    nx = 0
+                elif nx >= width:
+                    nx = width - 1
+                acc += row[nx] * kernel[k]
+            tmp_row[x] = acc
+
+    # ── Vertical pass (column by column) ─────────────────────────────
+    out = [[0.0] * width for _ in range(height)]
+    for y in range(height):
+        out_row = out[y]
+        for x in range(width):
+            acc = 0.0
+            for k in range(size):
+                ny = y + k - radius
+                if ny < 0:
+                    ny = 0
+                elif ny >= height:
+                    ny = height - 1
+                acc += tmp[ny][x] * kernel[k]
+            out_row[x] = acc
+    return out
+
+
+def apply_gaussian_blur(gray, width, height, sigma=1.0):
+    """Thin wrapper kept for backward-compat; delegates to separable version."""
+    return apply_gaussian_blur_sigma(gray, width, height, sigma)
 
 
 def compute_gradients(gray, width, height):
@@ -107,32 +108,52 @@ def compute_gradients(gray, width, height):
 
 def compute_structure_tensor(Ix, Iy, width, height, window_size=3):
     """
-    Compute second-moment (structure-tensor) elements Ixx, Ixy, Iyy
-    by summing Ix^2, Iy^2, Ix*Iy over a square window.
-    This matches the Harris M matrix from the lecture.
+    Compute second-moment tensor elements using 2-D integral images.
+
+    Each windowed sum is computed in O(1) after an O(W·H) prefix-sum
+    build — replacing the original O(window² · W · H) nested loop.
+    For a 3×3 window this is ~9× faster; for 5×5 it is ~25× faster.
     """
     half = window_size // 2
-    Ixx_raw = [[Ix[y][x] ** 2     for x in range(width)] for y in range(height)]
-    Iyy_raw = [[Iy[y][x] ** 2     for x in range(width)] for y in range(height)]
-    Ixy_raw = [[Ix[y][x]*Iy[y][x] for x in range(width)] for y in range(height)]
+
+    Ixx_r = [[Ix[y][x] * Ix[y][x] for x in range(width)] for y in range(height)]
+    Iyy_r = [[Iy[y][x] * Iy[y][x] for x in range(width)] for y in range(height)]
+    Ixy_r = [[Ix[y][x] * Iy[y][x] for x in range(width)] for y in range(height)]
+
+    def build_integral(src):
+        II = [[0.0] * (width + 1) for _ in range(height + 1)]
+        for y in range(height):
+            rs = 0.0
+            src_row = src[y]
+            II_row  = II[y + 1]
+            II_prev = II[y]
+            for x in range(width):
+                rs           += src_row[x]
+                II_row[x + 1] = rs + II_prev[x + 1]
+        return II
+
+    def rect_sum(II, y1, x1, y2, x2):
+        if y1 < 0: y1 = 0
+        if x1 < 0: x1 = 0
+        if y2 >= height: y2 = height - 1
+        if x2 >= width:  x2 = width  - 1
+        return (II[y2+1][x2+1] - II[y1][x2+1]
+              - II[y2+1][x1]   + II[y1][x1])
+
+    II_xx = build_integral(Ixx_r)
+    II_yy = build_integral(Iyy_r)
+    II_xy = build_integral(Ixy_r)
 
     Ixx = [[0.0] * width for _ in range(height)]
     Iyy = [[0.0] * width for _ in range(height)]
     Ixy = [[0.0] * width for _ in range(height)]
-
     for y in range(height):
         for x in range(width):
-            s_xx = s_yy = s_xy = 0.0
-            for wy in range(-half, half + 1):
-                for wx in range(-half, half + 1):
-                    ny = min(max(y + wy, 0), height - 1)
-                    nx = min(max(x + wx, 0), width - 1)
-                    s_xx += Ixx_raw[ny][nx]
-                    s_yy += Iyy_raw[ny][nx]
-                    s_xy += Ixy_raw[ny][nx]
-            Ixx[y][x] = s_xx
-            Iyy[y][x] = s_yy
-            Ixy[y][x] = s_xy
+            y1, x1 = y - half, x - half
+            y2, x2 = y + half, x + half
+            Ixx[y][x] = rect_sum(II_xx, y1, x1, y2, x2)
+            Iyy[y][x] = rect_sum(II_yy, y1, x1, y2, x2)
+            Ixy[y][x] = rect_sum(II_xy, y1, x1, y2, x2)
     return Ixx, Iyy, Ixy
 
 
@@ -233,14 +254,20 @@ def flatten_pixels(img):
 
 def build_scale_space(gray, width, height, sigma0=1.6, num_octaves=3, num_scales=4):
     """
-    Build a Gaussian scale-space pyramid.
+    Build a Gaussian scale-space pyramid using *incremental* blurring.
 
-    For each octave we blur the image at scales:
-        sigma_k = sigma0 * s^k,  k = 0 … num_scales
-    where s = 2^(1/num_scales)  (constant multiplier from Tutorial 5, slide 17).
+    Instead of re-blurring the base image at each scale (which needs
+    ever-growing kernels), each level applies only the *extra* blur
+    on top of the previous level:
 
-    Returns a list of octaves; each octave is a list of (blurred_2D_array, sigma).
-    Between octaves the image is down-sampled by 2 in each dimension.
+        G(sigma_k) = G(delta_k) ∗ G(sigma_{k-1})
+        delta_k    = sqrt(sigma_k² − sigma_{k-1}²)
+
+    This keeps all incremental kernels small (≈ first-level size),
+    giving a large speed-up with mathematically identical results
+    (convolution of Gaussians property).
+
+    Returns list of octaves; each octave is a list of (blurred_2D, sigma).
     """
     s = 2.0 ** (1.0 / num_scales)
     octaves = []
@@ -249,19 +276,30 @@ def build_scale_space(gray, width, height, sigma0=1.6, num_octaves=3, num_scales
 
     for _oct in range(num_octaves):
         oct_scales = []
-        for k in range(num_scales + 1):          # +1 so DoG gives num_scales layers
-            sigma_k = sigma0 * (s ** k)
-            blurred = apply_gaussian_blur_sigma(current_gray, cw, ch, sigma_k)
-            oct_scales.append((blurred, sigma_k))
+        # First level: blur base to sigma0
+        prev = apply_gaussian_blur_sigma(current_gray, cw, ch, sigma0)
+        oct_scales.append((prev, sigma0))
+        prev_sigma = sigma0
+
+        # Subsequent levels: incremental blur (small kernel each time)
+        for k in range(1, num_scales + 1):
+            curr_sigma = sigma0 * (s ** k)
+            # Extra sigma needed: sqrt(curr² − prev²)
+            inc = math.sqrt(max(curr_sigma * curr_sigma - prev_sigma * prev_sigma, 1e-4))
+            prev = apply_gaussian_blur_sigma(prev, cw, ch, inc)
+            oct_scales.append((prev, curr_sigma))
+            prev_sigma = curr_sigma
+
         octaves.append((oct_scales, cw, ch))
 
-        # Down-sample: take every other pixel for the next octave
+        # Down-sample for next octave
         new_cw = cw // 2
         new_ch = ch // 2
         if new_cw < 8 or new_ch < 8:
             break
-        base = oct_scales[num_scales][0]          # use the doubly-blurred layer
-        downsampled = [[base[y * 2][x * 2] for x in range(new_cw)] for y in range(new_ch)]
+        base = oct_scales[num_scales][0]
+        downsampled = [[base[y * 2][x * 2] for x in range(new_cw)]
+                       for y in range(new_ch)]
         current_gray = downsampled
         cw, ch = new_cw, new_ch
 
@@ -535,24 +573,21 @@ def match_descriptors(descs1, descs2, method="ssd", ratio_threshold=0.8):
 
 def draw_matches_on_images(img1, img2, kp1, kp2, matches, max_display=50):
     """
-    Create a side-by-side image with matched keypoints connected by lines.
-    kp1 / kp2: list of (x, y, sigma, …)
-    matches: list of (idx1, idx2, dist)
-    Returns a PIL Image.
+    Side-by-side match visualisation with Bresenham connecting lines.
+    kp1 / kp2 : list of (x, y, sigma, …)
+    matches    : list of (idx1, idx2, dist)
     """
-    # Downscale very large inputs so drawing stays fast and legible
     MAX_DIM = 400
 
     def resize_if_needed(img):
         w, h = img.size
         if w <= MAX_DIM and h <= MAX_DIM:
             return img, 1.0
-        s = MAX_DIM / max(w, h)
-        return img.resize((int(w * s), int(h * s)), Image.LANCZOS), s
+        sc = MAX_DIM / max(w, h)
+        return img.resize((int(w * sc), int(h * sc)), Image.LANCZOS), sc
 
     img1, s1 = resize_if_needed(img1)
     img2, s2 = resize_if_needed(img2)
-
     w1, h1 = img1.size
     w2, h2 = img2.size
     out_w = w1 + w2
@@ -561,39 +596,70 @@ def draw_matches_on_images(img1, img2, kp1, kp2, matches, max_display=50):
     out = Image.new("RGB", (out_w, out_h), (10, 10, 12))
     out.paste(img1, (0, 0))
     out.paste(img2, (w1, 0))
-
     pixels = out.load()
 
-    def draw_circle(cx, cy, r, color):
+    def bresenham(x0, y0, x1, y1, color):
+        """Bresenham integer line; blends 50% with background for subtlety."""
+        dx = abs(x1 - x0); dy = abs(y1 - y0)
+        sx = 1 if x1 > x0 else -1
+        sy = 1 if y1 > y0 else -1
+        err = dx - dy
+        cx, cy = x0, y0
+        while True:
+            if 0 <= cx < out_w and 0 <= cy < out_h:
+                bg = pixels[cx, cy]
+                pixels[cx, cy] = (
+                    (bg[0] + color[0]) >> 1,
+                    (bg[1] + color[1]) >> 1,
+                    (bg[2] + color[2]) >> 1,
+                )
+            if cx == x1 and cy == y1:
+                break
+            e2 = err << 1
+            if e2 > -dy:
+                err -= dy; cx += sx
+            if e2 < dx:
+                err += dx; cy += sy
+
+    def draw_dot(cx, cy, r, color):
+        """Filled circle."""
+        r2 = r * r
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
-                if abs(math.sqrt(dx * dx + dy * dy) - r) < 1.0:
+                if dx * dx + dy * dy <= r2:
                     px, py = cx + dx, cy + dy
                     if 0 <= px < out_w and 0 <= py < out_h:
                         pixels[px, py] = color
 
-    # Sort matches by distance (best first) and keep at most max_display
     matches_sorted = sorted(matches, key=lambda m: m[2])[:max_display]
-
     palette = [
-        (255, 80, 80), (80, 255, 80), (80, 80, 255),
-        (255, 255, 80), (255, 80, 255), (80, 255, 255),
-        (255, 160, 0), (160, 0, 255),
+        (255, 80,  80), (80, 255,  80), (80, 180, 255),
+        (255, 255, 80), (255, 80, 255), (80, 255, 210),
+        (255, 160,  0), (160,  0, 255), (0,  255, 160),
+        (255, 120, 120),
     ]
 
+    # Draw lines first (under dots)
     for rank, (i1, i2, dist) in enumerate(matches_sorted):
         if i1 >= len(kp1) or i2 >= len(kp2):
             continue
-        # Rescale coordinates if images were resized
         x1_pt = int(kp1[i1][0] * s1)
         y1_pt = int(kp1[i1][1] * s1)
         x2_pt = int(kp2[i2][0] * s2) + w1
         y2_pt = int(kp2[i2][1] * s2)
+        bresenham(x1_pt, y1_pt, x2_pt, y2_pt, palette[rank % len(palette)])
 
+    # Draw dots on top
+    for rank, (i1, i2, dist) in enumerate(matches_sorted):
+        if i1 >= len(kp1) or i2 >= len(kp2):
+            continue
+        x1_pt = int(kp1[i1][0] * s1)
+        y1_pt = int(kp1[i1][1] * s1)
+        x2_pt = int(kp2[i2][0] * s2) + w1
+        y2_pt = int(kp2[i2][1] * s2)
         color = palette[rank % len(palette)]
-        # Draw filled circles only (no connecting line) so the image stays clean
-        draw_circle(x1_pt, y1_pt, 4, color)
-        draw_circle(x2_pt, y2_pt, 4, color)
+        draw_dot(x1_pt, y1_pt, 4, color)
+        draw_dot(x2_pt, y2_pt, 4, color)
 
     return out
 
@@ -655,7 +721,7 @@ class SIFTFeatureExtractor:
             img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
         return img
 
-    def extract(self, img, max_keypoints=200, max_dim=350):
+    def extract(self, img, max_keypoints=150, max_dim=280):
         img = self._resize(img, max_dim=max_dim)
         width, height = img.size
         gray = image_to_grayscale(flatten_pixels(img), width, height)
@@ -874,8 +940,8 @@ class FeatureMatcher:
 
     def match(self, img1, img2, method="ssd", ratio_threshold=0.8, max_keypoints=150):
         t_sift_start = time.perf_counter()
-        feat1 = self.extractor.extract(img1, max_keypoints=max_keypoints, max_dim=380)
-        feat2 = self.extractor.extract(img2, max_keypoints=max_keypoints, max_dim=380)
+        feat1 = self.extractor.extract(img1, max_keypoints=max_keypoints, max_dim=280)
+        feat2 = self.extractor.extract(img2, max_keypoints=max_keypoints, max_dim=280)
         t_sift_end = time.perf_counter()
         sift_time_ms = (t_sift_end - t_sift_start) * 1000
 
@@ -893,9 +959,9 @@ class FeatureMatcher:
         else:
             matches = []
         if len(matches) < 40:
-            matches = self._filter_matches_ransac_affine(kp1, kp2, matches, thresh_px=14.0, iters=700, min_inliers=8)
+            matches = self._filter_matches_ransac_affine(kp1, kp2, matches, thresh_px=14.0, iters=250, min_inliers=6)
         else:
-            matches = self._filter_matches_ransac_affine(kp1, kp2, matches, thresh_px=10.0, iters=600, min_inliers=12)
+            matches = self._filter_matches_ransac_affine(kp1, kp2, matches, thresh_px=10.0, iters=350, min_inliers=10)
         matches = self._filter_matches_patch_ncc(kp1, kp2, matches, gray1, w1, h1, gray2, w2, h2, radius=6, min_ncc=0.15)
         t_match_end = time.perf_counter()
         match_time_ms = (t_match_end - t_match_start) * 1000
@@ -992,7 +1058,7 @@ def compute_sift(request):
     num_octaves         = int(data.get("num_octaves", 3))
     num_scales          = int(data.get("num_scales", 4))
     contrast_threshold  = float(data.get("contrast_threshold", 0.03))
-    max_keypoints       = int(data.get("max_keypoints", 200))
+    max_keypoints       = int(data.get("max_keypoints", 150))
 
     try:
         if "," in b64:
@@ -1008,7 +1074,7 @@ def compute_sift(request):
         contrast_threshold=contrast_threshold,
     )
     t_start = time.perf_counter()
-    features = extractor.extract(img, max_keypoints=max_keypoints, max_dim=350)
+    features = extractor.extract(img, max_keypoints=max_keypoints, max_dim=280)
     t_end = time.perf_counter()
 
     result_img = features["image"].copy()
@@ -1046,7 +1112,7 @@ def match_features(request):
     num_octaves        = int(data.get("num_octaves", 3))
     num_scales         = int(data.get("num_scales", 4))
     contrast_threshold = float(data.get("contrast_threshold", 0.03))
-    max_keypoints      = int(data.get("max_keypoints", 150))
+    max_keypoints      = int(data.get("max_keypoints", 100))
 
     def decode_image(b64):
         if "," in b64:
